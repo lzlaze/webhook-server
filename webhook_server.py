@@ -1,20 +1,18 @@
 from flask import Flask, request, jsonify
-import os, smtplib, requests, anthropic
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import os, requests, anthropic
 from datetime import datetime
 import pytz
 
 app = Flask(__name__)
 
-GMAIL_USER     = os.environ.get("GMAIL_USER", "")
-GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS", "")
-TO_EMAIL       = os.environ.get("TO_EMAIL", "")
-ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "mytrading2024")
+GMAIL_USER      = os.environ.get("GMAIL_USER", "")
+TO_EMAIL        = os.environ.get("TO_EMAIL", "")
+ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "mytrading2024")
+SENDGRID_KEY    = os.environ.get("SENDGRID_API_KEY", "")
 ET = pytz.timezone("America/New_York")
 
-def get_snapshot(ticker):
+def get_snapshot():
     snap = {}
     symbols = {"ES":"ES=F","YM":"YM=F","NQ":"NQ=F","VIX":"^VIX"}
     for name, sym in symbols.items():
@@ -26,8 +24,7 @@ def get_snapshot(ticker):
             closes = [c for c in closes if c is not None]
             if closes:
                 price = closes[-1]
-                open_p = closes[0]
-                pct = ((price - open_p) / open_p) * 100
+                pct = ((price - closes[0]) / closes[0]) * 100
                 snap[name] = {"price": price, "pct": pct}
         except Exception:
             pass
@@ -47,20 +44,21 @@ Note: {alert_data.get('note','')}
 Live snapshot:
 {snap_str}
 
-Write 3-4 sentences: what just happened, is the setup still valid, are ES and YM confirming or diverging, what to watch next. Be direct, no filler."""
+Write 3-4 sentences: what just happened, is the setup still valid, are ES and YM confirming or diverging, what to watch next. Direct, no filler."""
     msg = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=300, messages=[{"role":"user","content":prompt}])
     return msg.content[0].text
 
-def send_alert_email(alert_data, analysis, snapshot):
+def send_email(alert_data, analysis, snapshot):
     now_et = datetime.now(ET).strftime("%I:%M %p ET")
     ticker = alert_data.get("ticker","Alert")
     level  = alert_data.get("level_name","Key Level")
     price  = alert_data.get("price","")
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🚨 {ticker} hit {level} — {now_et}"
-    msg["From"] = GMAIL_USER
-    msg["To"]   = TO_EMAIL
-    snap_html = "".join([f"<div style='display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #1e2330'><span style='color:#5a6480;font-family:monospace'>{k}</span><span style='color:{'#00d4a0' if v['pct']>=0 else '#ff4d6d'};font-family:monospace'>${v['price']:,.2f} ({v['pct']:+.2f}%)</span></div>" for k,v in snapshot.items()])
+    snap_html = "".join([
+        f"<div style='display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #1e2330'>"
+        f"<span style='color:#5a6480;font-family:monospace'>{k}</span>"
+        f"<span style='color:{'#00d4a0' if v['pct']>=0 else '#ff4d6d'};font-family:monospace'>${v['price']:,.2f} ({v['pct']:+.2f}%)</span></div>"
+        for k,v in snapshot.items()
+    ])
     html = f"""<div style="background:#0a0c10;padding:24px;font-family:monospace;max-width:560px;margin:0 auto">
       <div style="color:#ff4d6d;font-size:11px;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:6px">⚡ Alert Triggered</div>
       <h2 style="color:#eef2ff;font-size:20px;margin:0 0 4px">{ticker} — {level}</h2>
@@ -73,11 +71,18 @@ def send_alert_email(alert_data, analysis, snapshot):
       <div style="color:#3a4060;font-size:11px;text-align:center;margin-top:16px">Not financial advice.</div>
     </div>"""
     text = f"ALERT: {ticker} hit {level} at {price} — {now_et}\n\n{analysis}"
-    msg.attach(MIMEText(text,"plain"))
-    msg.attach(MIMEText(html,"html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com",465) as s:
-        s.login(GMAIL_USER, GMAIL_APP_PASS)
-        s.sendmail(GMAIL_USER, TO_EMAIL, msg.as_string())
+    r = requests.post(
+        "https://api.sendgrid.com/v3/mail/send",
+        headers={"Authorization": f"Bearer {SENDGRID_KEY}", "Content-Type": "application/json"},
+        json={
+            "personalizations": [{"to": [{"email": TO_EMAIL}]}],
+            "from": {"email": GMAIL_USER},
+            "subject": f"🚨 {ticker} hit {level} — {now_et}",
+            "content": [{"type":"text/plain","value":text},{"type":"text/html","value":html}]
+        },
+        timeout=10
+    )
+    print(f"Email sent: {r.status_code}")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -86,12 +91,13 @@ def webhook():
         if not data: return jsonify({"error":"No JSON"}), 400
         if data.get("secret") != WEBHOOK_SECRET: return jsonify({"error":"Unauthorized"}), 401
         print(f"Alert received: {data}")
-        snapshot = get_snapshot(data.get("ticker",""))
+        snapshot = get_snapshot()
         analysis = generate_analysis(data, snapshot)
-        send_alert_email(data, analysis, snapshot)
+        send_email(data, analysis, snapshot)
         return jsonify({"status":"ok"}), 200
     except Exception as e:
         print(f"Error: {e}")
+        import traceback; traceback.print_exc()
         return jsonify({"error":str(e)}), 500
 
 @app.route("/health", methods=["GET"])
